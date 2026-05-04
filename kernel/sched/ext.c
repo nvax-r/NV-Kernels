@@ -572,6 +572,16 @@ do {										\
 	__ret;									\
 })
 
+#define SCX_CALL_OP_2TASKS(sch, op, rq, task0, task1, args...)			\
+do {										\
+	WARN_ON_ONCE(current->scx.kf_tasks[0]);					\
+	current->scx.kf_tasks[0] = task0;					\
+	current->scx.kf_tasks[1] = task1;					\
+	SCX_CALL_OP((sch), op, rq, task0, task1, ##args);			\
+	current->scx.kf_tasks[0] = NULL;					\
+	current->scx.kf_tasks[1] = NULL;					\
+} while (0)
+
 /* see SCX_CALL_OP_TASK() */
 static __always_inline bool scx_kf_arg_task_ok(struct scx_sched *sch,
 							struct task_struct *p)
@@ -1446,7 +1456,8 @@ static void local_dsq_post_enq(struct scx_dispatch_q *dsq, struct task_struct *p
 		preempt = true;
 	}
 
-	if (preempt || sched_class_above(&ext_sched_class, rq->curr->sched_class))
+	if (preempt || sched_class_above(&ext_sched_class,
+					 rq->curr->sched_class))
 		resched_curr(rq);
 }
 
@@ -2457,6 +2468,14 @@ retry:
 		if (unlikely(READ_ONCE(sch->aborting)) && dsq->id != SCX_DSQ_BYPASS)
 			break;
 
+		/*
+		 * Skip proxy-executing owners: they get CPU time via the
+		 * donor's entitlement, not by being consumed from a DSQ.
+		 * Leaving them on @dsq preserves their existing custody.
+		 */
+		if (unlikely(p->scx.flags & SCX_TASK_PROXY_EXEC))
+			continue;
+
 		if (rq == task_rq) {
 			task_unlink_from_dsq(p, dsq);
 			move_local_task_to_local_dsq(p, enq_flags, dsq, rq);
@@ -2606,6 +2625,15 @@ static void finish_dispatch(struct scx_sched *sch, struct rq *rq,
 	unsigned long opss;
 
 	touch_core_sched_dispatch(rq, p);
+
+	/*
+	 * Proxy-executing owners must not be dispatched onto a DSQ. They
+	 * receive CPU time through the donor's scheduling entitlement, not
+	 * through SCX dispatch decisions. Skip without claiming DISPATCHING
+	 * so the task remains in its existing OPSS / DSQ / custody state.
+	 */
+	if (unlikely(p->scx.flags & SCX_TASK_PROXY_EXEC))
+		return;
 retry:
 	/*
 	 * No need for _acquire here. @p is accessed only after a successful
@@ -3373,6 +3401,18 @@ static bool check_rq_for_timeouts(struct rq *rq)
 		struct scx_sched *sch = scx_task_sched(p);
 		unsigned long last_runnable = p->scx.runnable_at;
 
+		/*
+		 * A proxy-executing owner is making real forward progress on
+		 * the CPU via the donor's scheduling entitlement, even though
+		 * it is not being moved through SCX dispatch. Its
+		 * runnable_at is intentionally not refreshed (statistics
+		 * stay frozen during proxy execution), so do not let the
+		 * watchdog interpret that as a stall and tear the scheduler
+		 * down with SCX_EXIT_ERROR_STALL.
+		 */
+		if (unlikely(p->scx.flags & SCX_TASK_PROXY_EXEC))
+			continue;
+
 		if (unlikely(time_after(jiffies,
 					last_runnable + READ_ONCE(sch->watchdog_timeout)))) {
 			u32 dur_ms = jiffies_to_msecs(jiffies - last_runnable);
@@ -3431,6 +3471,68 @@ void scx_tick(struct rq *rq)
 	}
 
 	update_other_load_avgs(rq);
+}
+
+/**
+ * scx_proxy_exec_stopping - End a proxy execution episode for @owner
+ * @rq: runqueue currently running @owner as the proxy execution context
+ * @donor: scheduling-context task that was donating to @owner
+ * @owner: task that was proxy-executing (must have %SCX_TASK_PROXY_EXEC set)
+ *
+ * Called from __schedule() at the top, before pick_next_task(), when the
+ * previously-running task (rq->curr at function entry) carries
+ * %SCX_TASK_PROXY_EXEC. At that point rq->donor still references the
+ * donor that was active during the previous pick, which the caller passes
+ * in as @donor. The optional ops.proxy_stopping() callback fires first so
+ * BPF observes the flag as still set, then the flag is cleared.
+ *
+ * Context: rq->lock held; called outside any SCX op.
+ */
+void scx_proxy_exec_stopping(struct rq *rq,
+			     struct task_struct *donor,
+			     struct task_struct *owner)
+{
+	struct scx_sched *sch;
+
+	if (!scx_enabled())
+		goto clear;
+
+	sch = scx_task_sched(owner);
+	if (sch && SCX_HAS_OP(sch, proxy_stopping))
+		SCX_CALL_OP_2TASKS(sch, proxy_stopping, rq, donor, owner);
+clear:
+	owner->scx.flags &= ~SCX_TASK_PROXY_EXEC;
+}
+
+/**
+ * scx_proxy_exec_running - Start a proxy execution episode for @owner
+ * @rq: runqueue on which @owner will execute
+ * @donor: scheduling-context task whose entitlement is being donated
+ * @owner: execution-context task selected by find_proxy_task(), must be
+ *	   distinct from @donor and must be an SCX task (caller-checked)
+ *
+ * Called from __schedule() inside the proxy resolution block, immediately
+ * after find_proxy_task() returns an SCX owner that differs from the
+ * just-picked donor. The %SCX_TASK_PROXY_EXEC flag is set first so the
+ * optional ops.proxy_running() callback observes it as true, matching the
+ * symmetric stop semantics.
+ *
+ * Context: rq->lock held; called outside any SCX op.
+ */
+void scx_proxy_exec_running(struct rq *rq,
+			    struct task_struct *donor,
+			    struct task_struct *owner)
+{
+	struct scx_sched *sch;
+
+	owner->scx.flags |= SCX_TASK_PROXY_EXEC;
+
+	if (!scx_enabled())
+		return;
+
+	sch = scx_task_sched(owner);
+	if (sch && SCX_HAS_OP(sch, proxy_running))
+		SCX_CALL_OP_2TASKS(sch, proxy_running, rq, donor, owner);
 }
 
 static void task_tick_scx(struct rq *rq, struct task_struct *curr, int queued)
@@ -4028,6 +4130,15 @@ static u32 reenq_local(struct scx_sched *sch, struct rq *rq, u64 reenq_flags)
 		 * visible to the BPF scheduler.
 		 */
 		if (p->migration_pending)
+			continue;
+
+		/*
+		 * Skip proxy-executing owners. dispatch_dequeue() would
+		 * remove @p from the local DSQ, breaking the invariant that
+		 * the owner stays in its existing DSQ/custody state during
+		 * proxy execution.
+		 */
+		if (unlikely(p->scx.flags & SCX_TASK_PROXY_EXEC))
 			continue;
 
 		if (!scx_is_descendant(task_sch, sch))
@@ -6262,6 +6373,9 @@ static void scx_dump_state(struct scx_sched *sch, struct scx_exit_info *ei,
 		dump_line(&ns, "          curr=%s[%d] class=%ps",
 			  rq->curr->comm, rq->curr->pid,
 			  rq->curr->sched_class);
+		dump_line(&ns, "          donor=%s[%d] class=%ps",
+			  rq->donor->comm, rq->donor->pid,
+			  rq->donor->sched_class);
 		if (!cpumask_empty(rq->scx.cpus_to_kick))
 			dump_line(&ns, "  cpus_to_kick   : %*pb",
 				  cpumask_pr_args(rq->scx.cpus_to_kick));
@@ -7509,6 +7623,8 @@ static void sched_ext_ops__tick(struct task_struct *p) {}
 static void sched_ext_ops__runnable(struct task_struct *p, u64 enq_flags) {}
 static void sched_ext_ops__running(struct task_struct *p) {}
 static void sched_ext_ops__stopping(struct task_struct *p, bool runnable) {}
+static void sched_ext_ops__proxy_running(struct task_struct *donor, struct task_struct *owner) {}
+static void sched_ext_ops__proxy_stopping(struct task_struct *donor, struct task_struct *owner) {}
 static void sched_ext_ops__quiescent(struct task_struct *p, u64 deq_flags) {}
 static bool sched_ext_ops__yield(struct task_struct *from, struct task_struct *to__nullable) { return false; }
 static bool sched_ext_ops__core_sched_before(struct task_struct *a, struct task_struct *b) { return false; }
@@ -7550,6 +7666,8 @@ static struct sched_ext_ops __bpf_ops_sched_ext_ops = {
 	.runnable		= sched_ext_ops__runnable,
 	.running		= sched_ext_ops__running,
 	.stopping		= sched_ext_ops__stopping,
+	.proxy_running		= sched_ext_ops__proxy_running,
+	.proxy_stopping		= sched_ext_ops__proxy_stopping,
 	.quiescent		= sched_ext_ops__quiescent,
 	.yield			= sched_ext_ops__yield,
 	.core_sched_before	= sched_ext_ops__core_sched_before,
@@ -8177,6 +8295,16 @@ static bool scx_dsq_move(struct bpf_iter_scx_dsq_kern *kit,
 			  p->comm, p->pid);
 		return false;
 	}
+
+	/*
+	 * Refuse to move a proxy-executing owner. It is currently the
+	 * execution context for a different scheduling-context donor and
+	 * must stay in its existing DSQ/custody state until proxy execution
+	 * ends. Returning false rejects the move without consuming or
+	 * relocating @p; not a kernel error, just a no-op for the caller.
+	 */
+	if (unlikely(p->scx.flags & SCX_TASK_PROXY_EXEC))
+		return false;
 
 	/*
 	 * Can be called from either ops.dispatch() locking this_rq() or any
@@ -9410,6 +9538,50 @@ __bpf_kfunc struct task_struct *scx_bpf_cpu_curr(s32 cpu, const struct bpf_prog_
 }
 
 /**
+ * scx_bpf_cpu_donor - Return remote CPU's donor (scheduling-context) task
+ * @cpu: CPU of interest
+ * @aux: implicit BPF argument to access bpf_prog_aux hidden from BPF progs
+ *
+ * Returns the task that owns the scheduling entitlement on @cpu's runqueue
+ * (rq->donor). With proxy execution, this may differ from rq->curr when a
+ * mutex owner is executing on behalf of a blocked donor. Use
+ * scx_bpf_cpu_curr() to get the execution context instead.
+ *
+ * Callers must hold RCU read lock (KF_RCU).
+ */
+__bpf_kfunc struct task_struct *scx_bpf_cpu_donor(s32 cpu, const struct bpf_prog_aux *aux)
+{
+	struct scx_sched *sch;
+
+	guard(rcu)();
+
+	sch = scx_prog_sched(aux);
+	if (unlikely(!sch))
+		return NULL;
+
+	if (!ops_cpu_valid(sch, cpu, NULL))
+		return NULL;
+
+	return rcu_dereference(cpu_rq(cpu)->donor);
+}
+
+/**
+ * scx_bpf_task_proxy_executing - Is task currently a proxy execution context?
+ * @p: task of interest
+ *
+ * Returns true when @p has %SCX_TASK_PROXY_EXEC set, meaning it is currently
+ * running on a CPU as the execution context for a different scheduling-context
+ * donor via core proxy execution. The flag is set immediately before
+ * ops.proxy_running() fires and cleared immediately after ops.proxy_stopping()
+ * returns, so it reads as true throughout a proxy episode (including from
+ * within those callbacks).
+ */
+__bpf_kfunc bool scx_bpf_task_proxy_executing(const struct task_struct *p)
+{
+	return !!(READ_ONCE(p->scx.flags) & SCX_TASK_PROXY_EXEC);
+}
+
+/**
  * scx_bpf_tid_to_task - Look up a task by its scx tid
  * @tid: task ID previously read from p->scx.tid
  *
@@ -9616,10 +9788,12 @@ BTF_ID_FLAGS(func, scx_bpf_get_possible_cpumask, KF_ACQUIRE)
 BTF_ID_FLAGS(func, scx_bpf_get_online_cpumask, KF_ACQUIRE)
 BTF_ID_FLAGS(func, scx_bpf_put_cpumask, KF_RELEASE)
 BTF_ID_FLAGS(func, scx_bpf_task_running, KF_RCU)
+BTF_ID_FLAGS(func, scx_bpf_task_proxy_executing, KF_RCU)
 BTF_ID_FLAGS(func, scx_bpf_task_cpu, KF_RCU)
 BTF_ID_FLAGS(func, scx_bpf_cpu_rq, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, scx_bpf_locked_rq, KF_IMPLICIT_ARGS | KF_RET_NULL)
 BTF_ID_FLAGS(func, scx_bpf_cpu_curr, KF_IMPLICIT_ARGS | KF_RET_NULL | KF_RCU_PROTECTED)
+BTF_ID_FLAGS(func, scx_bpf_cpu_donor, KF_IMPLICIT_ARGS | KF_RET_NULL | KF_RCU_PROTECTED)
 BTF_ID_FLAGS(func, scx_bpf_tid_to_task, KF_RET_NULL | KF_RCU_PROTECTED)
 BTF_ID_FLAGS(func, scx_bpf_now)
 BTF_ID_FLAGS(func, scx_bpf_events)

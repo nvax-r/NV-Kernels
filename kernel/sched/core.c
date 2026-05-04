@@ -7035,6 +7035,17 @@ static void __sched notrace __schedule(int sched_mode)
 	rq = cpu_rq(cpu);
 	prev = rq->curr;
 
+	/*
+	 * If @prev is currently the proxy execution context for an SCX task,
+	 * the proxy episode is ending now: notify SCX before pick_next_task()
+	 * disturbs anything. rq->donor still references the donor that was
+	 * active during the previous pick, which is exactly what
+	 * ops.proxy_stopping() wants. The flag is cleared inside the helper.
+	 * No-op when CONFIG_SCHED_CLASS_EXT is disabled.
+	 */
+	if (sched_proxy_exec() && scx_task_proxy_executing(prev))
+		scx_proxy_exec_stopping(rq, rq->donor, prev);
+
 	schedule_debug(prev, preempt);
 
 	klp_sched_try_switch(prev);
@@ -7117,6 +7128,15 @@ pick_again:
 				zap_balance_callbacks(rq);
 				goto keep_resched;
 			}
+			/*
+			 * find_proxy_task() resolved an execution context
+			 * distinct from the donor. If the resolved owner is
+			 * an SCX task, a new proxy execution episode begins
+			 * now: notify SCX (sets %SCX_TASK_PROXY_EXEC and
+			 * fires ops.proxy_running()). No-op otherwise.
+			 */
+			if (next != rq->donor && task_on_scx(next))
+				scx_proxy_exec_running(rq, rq->donor, next);
 		}
 		if (rq->donor == prev_donor && prev != next) {
 			struct task_struct *donor = rq->donor;

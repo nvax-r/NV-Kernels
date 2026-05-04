@@ -462,6 +462,47 @@ struct sched_ext_ops {
 	void (*stopping)(struct task_struct *p, bool runnable);
 
 	/**
+	 * @proxy_running: A proxy execution relationship is starting on this CPU
+	 * @donor: scheduling-context task whose entitlement is being donated
+	 * @owner: execution-context task that will run on the CPU (rq->curr)
+	 *
+	 * Invoked from __schedule() after find_proxy_task() has resolved a
+	 * mutex owner that is distinct from the picked donor and is an SCX
+	 * task. This reports the (donor, owner) pair to the BPF scheduler
+	 * before context_switch() runs and before rq->curr is committed.
+	 *
+	 * The owner has SCX_TASK_PROXY_EXEC set when this fires. The owner
+	 * remains in its existing DSQ/custody state; proxy execution does
+	 * not imply BPF dispatch or DSQ consumption for the owner. SCX
+	 * dispatch, DSQ move, migration and watchdog paths skip the owner
+	 * while the flag is set; see the SCX_TASK_PROXY_EXEC guards in
+	 * finish_dispatch(), consume_dispatch_q(), scx_dsq_move(),
+	 * reenq_local() and check_rq_for_timeouts().
+	 *
+	 * The existing ops.running() callback continues to fire for the
+	 * donor and is unchanged by proxy execution.
+	 */
+	void (*proxy_running)(struct task_struct *donor,
+			      struct task_struct *owner);
+
+	/**
+	 * @proxy_stopping: A proxy execution relationship is ending on this CPU
+	 * @donor: scheduling-context task whose entitlement was donated
+	 * @owner: execution-context task that was running as the proxy
+	 *
+	 * Invoked from __schedule() on the next pick when @owner was the
+	 * previous proxy execution context (i.e. @owner had
+	 * SCX_TASK_PROXY_EXEC set on entry to __schedule). The flag is
+	 * cleared after this callback returns.
+	 *
+	 * @donor is the donor that was active when the proxy episode began;
+	 * it may not be the same task that ops.stopping() saw, since the
+	 * donor side may have changed independently.
+	 */
+	void (*proxy_stopping)(struct task_struct *donor,
+			       struct task_struct *owner);
+
+	/**
 	 * @quiescent: A task is becoming not runnable on its associated CPU
 	 * @p: task becoming not runnable
 	 * @deq_flags: %SCX_DEQ_*

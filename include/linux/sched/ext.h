@@ -101,6 +101,11 @@ enum scx_ent_flags {
 	SCX_TASK_DEQD_FOR_SLEEP	= 1 << 3, /* last dequeue was for SLEEP */
 	SCX_TASK_SUB_INIT	= 1 << 4, /* task being initialized for a sub sched */
 	SCX_TASK_IMMED		= 1 << 5, /* task is on local DSQ with %SCX_ENQ_IMMED */
+	SCX_TASK_PROXY_EXEC	= 1 << 6, /* task is currently the proxy execution
+					   * context (rq->curr) for a different
+					   * scheduling-context donor (rq->donor)
+					   * via core proxy execution
+					   */
 
 	/*
 	 * Bits 8 and 9 are used to carry task state:
