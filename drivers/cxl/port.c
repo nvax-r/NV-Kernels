@@ -47,6 +47,14 @@ static int discover_region(struct device *dev, void *unused)
 		return 0;
 
 	/*
+	 * A committed decoder that decodes zero HPA (e.g. a BIOS-burned,
+	 * locked slot per CXL r3.2 8.2.4.20.12) is a member of no region.
+	 * Skip it so autodiscovery does not build a phantom region for it.
+	 */
+	if (!cxled->dpa_res || !resource_size(cxled->dpa_res))
+		return 0;
+
+	/*
 	 * Region enumeration is opportunistic, if this add-event fails,
 	 * continue to the next endpoint decoder.
 	 */
