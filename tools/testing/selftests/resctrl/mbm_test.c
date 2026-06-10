@@ -123,6 +123,7 @@ static int mbm_measure(const struct user_params *uparams,
 
 static void mbm_test_cleanup(void)
 {
+	mem_bw_ref_cleanup();
 	remove(RESULT_FILE_NAME);
 }
 

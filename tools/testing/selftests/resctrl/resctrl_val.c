@@ -34,12 +34,29 @@ struct mem_bw_counter {
 	struct perf_event_attr pe;
 	struct membw_read_format return_value;
 	int fd;
+	int cpu;
+};
+
+/*
+ * mem_bw_backend - Source of the independent reference bandwidth that
+ *		    validates resctrl MBM
+ * @name:		Human-readable PMU name
+ * @detect:		True if this backend's PMU is present on the system
+ * @setup_counters:	Populate bw_counters[] / nr_bw_counters with the perf
+ *			events measuring memory bandwidth generated from
+ *			@bench_cpu. Returns 0 on success, < 0 on failure.
+ */
+struct mem_bw_backend {
+	const char *name;
+	bool (*detect)(void);
+	int (*setup_counters)(int bench_cpu);
 };
 
 static char mbm_total_path[1024];
 static int nr_bw_counters;
 static struct mem_bw_counter bw_counters[MAX_BW_COUNTERS];
 static const struct resctrl_test *current_test;
+static const struct mem_bw_backend *mem_bw_backend;
 
 static void read_mem_bw_initialize_perf_event_attr(int i)
 {
@@ -94,10 +111,11 @@ static void get_read_event_and_umask(char *cas_count_cfg, int count)
 	}
 }
 
-static int open_perf_read_event(int i, int cpu_no)
+static int open_perf_read_event(int i)
 {
 	bw_counters[i].fd =
-		perf_event_open(&bw_counters[i].pe, -1, cpu_no, -1,
+		perf_event_open(&bw_counters[i].pe, -1,
+				bw_counters[i].cpu, -1,
 				PERF_FLAG_FD_CLOEXEC);
 
 	if (bw_counters[i].fd == -1) {
@@ -221,19 +239,106 @@ static int num_of_imcs(void)
 	return count;
 }
 
+/* True if any x86 uncore iMC PMU ("uncore_imc_<n>") is present. */
+static bool intel_imc_present(void)
+{
+	struct dirent *ep;
+	bool found = false;
+	char *temp;
+	DIR *dp;
+
+	dp = opendir(DYN_PMU_PATH);
+	if (!dp)
+		return false;
+	while ((ep = readdir(dp))) {
+		temp = strstr(ep->d_name, UNCORE_IMC);
+		if (!temp)
+			continue;
+		temp += sizeof(UNCORE_IMC);
+		if (temp[0] >= '0' && temp[0] <= '9') {
+			found = true;
+			break;
+		}
+	}
+	closedir(dp);
+	return found;
+}
+
+/*
+ * imc_setup_counters - Configure iMC CAS-count-read counters
+ * @bench_cpu: CPU the benchmark is bound to
+ *
+ * Discovers all iMC PMUs and configures one read-bandwidth counter per iMC,
+ * opened on the benchmark CPU (each iMC counts socket-wide regardless).
+ *
+ * Return: 0 on success, < 0 on failure.
+ */
+static int imc_setup_counters(int bench_cpu)
+{
+	int i, count;
+
+	count = num_of_imcs();
+	if (count <= 0)
+		return -1;
+
+	nr_bw_counters = count;
+	for (i = 0; i < nr_bw_counters; i++) {
+		read_mem_bw_initialize_perf_event_attr(i);
+		bw_counters[i].cpu = bench_cpu;
+	}
+
+	return 0;
+}
+
+static const struct mem_bw_backend mem_bw_backends[] = {
+	{
+		.name = "Intel iMC",
+		.detect = intel_imc_present,
+		.setup_counters = imc_setup_counters,
+	},
+};
+
+/*
+ * mem_bw_ref_available - Is an independent reference-bandwidth PMU present?
+ *
+ * Used by the MBA/MBM feature checks so the test is SKIPped (not failed) on
+ * hardware lacking a usable memory-bandwidth PMU.
+ */
+bool mem_bw_ref_available(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(mem_bw_backends); i++) {
+		if (mem_bw_backends[i].detect())
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * initialize_mem_bw_ref - Select the reference-bandwidth backend for this system
+ *
+ * Counter discovery happens at perf-open time through the backend's
+ * setup_counters() since it can depend on the benchmark CPU.
+ *
+ * Return: 0 on success, < 0 if no reference PMU is available.
+ */
 int initialize_mem_bw_ref(void)
 {
 	int i;
 
-	nr_bw_counters = num_of_imcs();
-	if (nr_bw_counters <= 0)
-		return nr_bw_counters;
+	for (i = 0; i < ARRAY_SIZE(mem_bw_backends); i++) {
+		if (mem_bw_backends[i].detect()) {
+			mem_bw_backend = &mem_bw_backends[i];
+			ksft_print_msg("Using %s as memory bandwidth reference\n",
+				       mem_bw_backend->name);
+			return 0;
+		}
+	}
 
-	/* Initialize perf_event_attr structures for all iMC's */
-	for (i = 0; i < nr_bw_counters; i++)
-		read_mem_bw_initialize_perf_event_attr(i);
-
-	return 0;
+	ksft_print_msg("No memory bandwidth reference PMU found\n");
+	return -1;
 }
 
 static void perf_close_mem_bw_counters(void)
@@ -250,17 +355,27 @@ static void perf_close_mem_bw_counters(void)
  * perf_open_mem_bw_counters - Open perf fds for the reference-bandwidth counters
  * @cpu_no: CPU number that the benchmark PID is bound to
  *
+ * Counters are (re)configured by the selected backend first since their
+ * discovery can depend on the benchmark CPU (e.g. per-socket PMU instances).
+ *
  * Return: = 0 on success. < 0 on failure.
  */
 static int perf_open_mem_bw_counters(int cpu_no)
 {
 	int i, ret;
 
+	if (!mem_bw_backend)
+		return -1;
+
+	ret = mem_bw_backend->setup_counters(cpu_no);
+	if (ret < 0)
+		return ret;
+
 	for (i = 0; i < nr_bw_counters; i++)
 		bw_counters[i].fd = -1;
 
 	for (i = 0; i < nr_bw_counters; i++) {
-		ret = open_perf_read_event(i, cpu_no);
+		ret = open_perf_read_event(i);
 		if (ret)
 			goto close_fds;
 	}
@@ -343,6 +458,16 @@ void initialize_mem_bw_resctrl(const struct resctrl_val_param *param,
 {
 	sprintf(mbm_total_path, CON_MBM_LOCAL_BYTES_PATH, RESCTRL_PATH,
 		param->ctrlgrp, domain_id);
+}
+
+/*
+ * mem_bw_ref_cleanup - Reset the selected reference-bandwidth backend
+ *
+ * Safe to call when no backend was selected.
+ */
+void mem_bw_ref_cleanup(void)
+{
+	mem_bw_backend = NULL;
 }
 
 /*
