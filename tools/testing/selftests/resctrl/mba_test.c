@@ -211,7 +211,8 @@ static int mba_run_test(const struct resctrl_test *test, const struct user_param
 static bool mba_feature_check(const struct resctrl_test *test)
 {
 	return test_resource_feature_check(test) &&
-	       resctrl_mon_feature_exists("L3_MON", "mbm_local_bytes") &&
+	       (resctrl_mon_feature_exists("L3_MON", "mbm_local_bytes") ||
+		resctrl_mon_feature_exists("MB_MON", "mbm_total_bytes")) &&
 	       mem_bw_ref_available();
 }
 

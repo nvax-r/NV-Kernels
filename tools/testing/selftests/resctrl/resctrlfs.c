@@ -122,10 +122,39 @@ static int get_resource_cache_level(const char *resource)
 }
 
 /*
+ * cpu_to_numa_node - NUMA node a logical CPU belongs to
+ * @cpu_no:	CPU number
+ *
+ * Reads the "node<N>" symlink in the CPU's sysfs directory.
+ *
+ * Return: NUMA node id (>= 0) on success, < 0 on failure.
+ */
+static int cpu_to_numa_node(int cpu_no)
+{
+	char cpu_dir[1024];
+	struct dirent *ep;
+	int node = -1;
+	DIR *dp;
+
+	snprintf(cpu_dir, sizeof(cpu_dir), "%s%d", PHYS_ID_PATH, cpu_no);
+	dp = opendir(cpu_dir);
+	if (!dp)
+		return -1;
+	while ((ep = readdir(dp))) {
+		if (!strncmp(ep->d_name, "node", 4) && isdigit(ep->d_name[4])) {
+			node = atoi(ep->d_name + 4);
+			break;
+		}
+	}
+	closedir(dp);
+	return node;
+}
+
+/*
  * get_domain_id - Get resctrl domain ID for a specified CPU
  * @resource:	resource name
  * @cpu_no:	CPU number
- * @domain_id:	domain ID (cache ID; for MB, L3 cache ID)
+ * @domain_id:	domain ID (cache ID; for MB, L3 cache ID, or NUMA node on MPAM)
  *
  * Return: >= 0 on success, < 0 on failure.
  */
@@ -134,6 +163,20 @@ int get_domain_id(const char *resource, int cpu_no, int *domain_id)
 	char phys_pkg_path[1024];
 	int cache_num;
 	FILE *fp;
+
+	/*
+	 * On MPAM the MB monitoring/allocation domains are keyed by NUMA node
+	 * (surfaced via a separate MB_MON group) and need not match the L3 cache
+	 * id used on x86, so resolve the MB domain from the CPU's NUMA node.
+	 */
+	if (!strcmp(resource, "MB") && resctrl_resource_exists("MB_MON")) {
+		int node = cpu_to_numa_node(cpu_no);
+
+		if (node >= 0) {
+			*domain_id = node;
+			return 0;
+		}
+	}
 
 	cache_num = get_resource_cache_level(resource);
 	if (cache_num < 0)

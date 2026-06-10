@@ -20,6 +20,21 @@
 #define CON_MBM_LOCAL_BYTES_PATH		\
 	"%s/%s/mon_data/mon_L3_%02d/mbm_local_bytes"
 
+/*
+ * MPAM exposes only total (read+write) bandwidth, under MB_MON, and per the
+ * NUMA-node-keyed MB domain rather than the L3 cache id.
+ */
+#define CON_MBM_TOTAL_BYTES_PATH		\
+	"%s/%s/mon_data/mon_MB_%02d/mbm_total_bytes"
+
+/*
+ * In MPAM "mbm_event" (ABMC) counter-assignment mode a hardware counter must
+ * be explicitly assigned to a group+domain+event before the bandwidth file
+ * reads a value; otherwise it returns "Unassigned".
+ */
+#define MBM_MB_ASSIGN_PATH			\
+	"%s/%s/mbm_MB_assignments"
+
 struct membw_read_format {
 	__u64 value;         /* The value of the event */
 	__u64 time_enabled;  /* if PERF_FORMAT_TOTAL_TIME_ENABLED */
@@ -57,6 +72,10 @@ static int nr_bw_counters;
 static struct mem_bw_counter bw_counters[MAX_BW_COUNTERS];
 static const struct resctrl_test *current_test;
 static const struct mem_bw_backend *mem_bw_backend;
+
+/* MPAM ABMC counter assignment state, see initialize_mem_bw_resctrl(). */
+static char mbm_assign_path[1024];
+static int mbm_assign_domain = -1;
 
 static void read_mem_bw_initialize_perf_event_attr(int i)
 {
@@ -452,21 +471,63 @@ static int get_mem_bw_ref(float *bw_ref)
  * initialize_mem_bw_resctrl:	Appropriately populate "mbm_total_path"
  * @param:	Parameters passed to resctrl_val()
  * @domain_id:	Domain ID (cache ID; for MB, L3 cache ID)
+ *
+ * x86 resctrl reports per-RMID local bandwidth under L3_MON. MPAM exposes only
+ * total (read+write) bandwidth under MB_MON, indexed by the NUMA-node-keyed MB
+ * domain, and in "mbm_event" (ABMC) mode a hardware counter must be assigned to
+ * the group+domain before the file reads a value.
  */
 void initialize_mem_bw_resctrl(const struct resctrl_val_param *param,
 			       int domain_id)
 {
-	sprintf(mbm_total_path, CON_MBM_LOCAL_BYTES_PATH, RESCTRL_PATH,
-		param->ctrlgrp, domain_id);
+	const char *grp = param->ctrlgrp ? param->ctrlgrp : "";
+
+	if (resctrl_mon_feature_exists("L3_MON", "mbm_local_bytes")) {
+		sprintf(mbm_total_path, CON_MBM_LOCAL_BYTES_PATH, RESCTRL_PATH,
+			grp, domain_id);
+		return;
+	}
+
+	/* MPAM: total bandwidth under MB_MON. */
+	sprintf(mbm_total_path, CON_MBM_TOTAL_BYTES_PATH, RESCTRL_PATH,
+		grp, domain_id);
+
+	/* Assign an ABMC counter for this group+domain if in mbm_event mode. */
+	snprintf(mbm_assign_path, sizeof(mbm_assign_path), MBM_MB_ASSIGN_PATH,
+		 RESCTRL_PATH, grp);
+	if (access(mbm_assign_path, W_OK) == 0) {
+		FILE *fp = fopen(mbm_assign_path, "w");
+
+		if (fp) {
+			/* The assignment parser requires a trailing newline. */
+			fprintf(fp, "mbm_total_bytes:%d=e\n", domain_id);
+			fclose(fp);
+			mbm_assign_domain = domain_id;
+		}
+	} else {
+		/* Not in counter-assignment mode (or no MB_MON); nothing to do. */
+		mbm_assign_path[0] = '\0';
+	}
 }
 
 /*
- * mem_bw_ref_cleanup - Reset the selected reference-bandwidth backend
+ * mem_bw_ref_cleanup - Release an assigned ABMC counter and reset backend state
  *
- * Safe to call when no backend was selected.
+ * Group removal does not reclaim assigned MPAM counters, so the test must
+ * unassign explicitly. Safe to call when nothing was assigned.
  */
 void mem_bw_ref_cleanup(void)
 {
+	if (mbm_assign_domain >= 0 && mbm_assign_path[0]) {
+		FILE *fp = fopen(mbm_assign_path, "w");
+
+		if (fp) {
+			fprintf(fp, "mbm_total_bytes:%d=_\n", mbm_assign_domain);
+			fclose(fp);
+		}
+	}
+	mbm_assign_domain = -1;
+	mbm_assign_path[0] = '\0';
 	mem_bw_backend = NULL;
 }
 
