@@ -14,7 +14,7 @@
 #define READ_FILE_NAME		"events/cas_count_read"
 #define DYN_PMU_PATH		"/sys/bus/event_source/devices"
 #define SCALE			0.00006103515625
-#define MAX_IMCS		20
+#define MAX_BW_COUNTERS		20
 #define MAX_TOKENS		5
 
 #define CON_MBM_LOCAL_BYTES_PATH		\
@@ -27,7 +27,7 @@ struct membw_read_format {
 	__u64 id;            /* if PERF_FORMAT_ID */
 };
 
-struct imc_counter_config {
+struct mem_bw_counter {
 	__u32 type;
 	__u64 event;
 	__u64 umask;
@@ -37,36 +37,36 @@ struct imc_counter_config {
 };
 
 static char mbm_total_path[1024];
-static int imcs;
-static struct imc_counter_config imc_counters_config[MAX_IMCS];
+static int nr_bw_counters;
+static struct mem_bw_counter bw_counters[MAX_BW_COUNTERS];
 static const struct resctrl_test *current_test;
 
 static void read_mem_bw_initialize_perf_event_attr(int i)
 {
-	memset(&imc_counters_config[i].pe, 0,
+	memset(&bw_counters[i].pe, 0,
 	       sizeof(struct perf_event_attr));
-	imc_counters_config[i].pe.type = imc_counters_config[i].type;
-	imc_counters_config[i].pe.size = sizeof(struct perf_event_attr);
-	imc_counters_config[i].pe.disabled = 1;
-	imc_counters_config[i].pe.inherit = 1;
-	imc_counters_config[i].pe.exclude_guest = 0;
-	imc_counters_config[i].pe.config =
-		imc_counters_config[i].umask << 8 |
-		imc_counters_config[i].event;
-	imc_counters_config[i].pe.sample_type = PERF_SAMPLE_IDENTIFIER;
-	imc_counters_config[i].pe.read_format =
+	bw_counters[i].pe.type = bw_counters[i].type;
+	bw_counters[i].pe.size = sizeof(struct perf_event_attr);
+	bw_counters[i].pe.disabled = 1;
+	bw_counters[i].pe.inherit = 1;
+	bw_counters[i].pe.exclude_guest = 0;
+	bw_counters[i].pe.config =
+		bw_counters[i].umask << 8 |
+		bw_counters[i].event;
+	bw_counters[i].pe.sample_type = PERF_SAMPLE_IDENTIFIER;
+	bw_counters[i].pe.read_format =
 		PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 }
 
 static void read_mem_bw_ioctl_perf_event_ioc_reset_enable(int i)
 {
-	ioctl(imc_counters_config[i].fd, PERF_EVENT_IOC_RESET, 0);
-	ioctl(imc_counters_config[i].fd, PERF_EVENT_IOC_ENABLE, 0);
+	ioctl(bw_counters[i].fd, PERF_EVENT_IOC_RESET, 0);
+	ioctl(bw_counters[i].fd, PERF_EVENT_IOC_ENABLE, 0);
 }
 
 static void read_mem_bw_ioctl_perf_event_ioc_disable(int i)
 {
-	ioctl(imc_counters_config[i].fd, PERF_EVENT_IOC_DISABLE, 0);
+	ioctl(bw_counters[i].fd, PERF_EVENT_IOC_DISABLE, 0);
 }
 
 /*
@@ -88,21 +88,21 @@ static void get_read_event_and_umask(char *cas_count_cfg, int count)
 		if (!token[i])
 			break;
 		if (strcmp(token[i], "event") == 0)
-			imc_counters_config[count].event = strtol(token[i + 1], NULL, 16);
+			bw_counters[count].event = strtol(token[i + 1], NULL, 16);
 		if (strcmp(token[i], "umask") == 0)
-			imc_counters_config[count].umask = strtol(token[i + 1], NULL, 16);
+			bw_counters[count].umask = strtol(token[i + 1], NULL, 16);
 	}
 }
 
 static int open_perf_read_event(int i, int cpu_no)
 {
-	imc_counters_config[i].fd =
-		perf_event_open(&imc_counters_config[i].pe, -1, cpu_no, -1,
+	bw_counters[i].fd =
+		perf_event_open(&bw_counters[i].pe, -1, cpu_no, -1,
 				PERF_FLAG_FD_CLOEXEC);
 
-	if (imc_counters_config[i].fd == -1) {
+	if (bw_counters[i].fd == -1) {
 		fprintf(stderr, "Error opening leader %llx\n",
-			imc_counters_config[i].pe.config);
+			bw_counters[i].pe.config);
 
 		return -1;
 	}
@@ -124,7 +124,7 @@ static int read_from_imc_dir(char *imc_dir, int count)
 
 		return -1;
 	}
-	if (fscanf(fp, "%u", &imc_counters_config[count].type) <= 0) {
+	if (fscanf(fp, "%u", &bw_counters[count].type) <= 0) {
 		ksft_perror("Could not get iMC type");
 		fclose(fp);
 
@@ -221,46 +221,46 @@ static int num_of_imcs(void)
 	return count;
 }
 
-int initialize_read_mem_bw_imc(void)
+int initialize_mem_bw_ref(void)
 {
-	int imc;
+	int i;
 
-	imcs = num_of_imcs();
-	if (imcs <= 0)
-		return imcs;
+	nr_bw_counters = num_of_imcs();
+	if (nr_bw_counters <= 0)
+		return nr_bw_counters;
 
 	/* Initialize perf_event_attr structures for all iMC's */
-	for (imc = 0; imc < imcs; imc++)
-		read_mem_bw_initialize_perf_event_attr(imc);
+	for (i = 0; i < nr_bw_counters; i++)
+		read_mem_bw_initialize_perf_event_attr(i);
 
 	return 0;
 }
 
-static void perf_close_imc_read_mem_bw(void)
+static void perf_close_mem_bw_counters(void)
 {
-	int mc;
+	int i;
 
-	for (mc = 0; mc < imcs; mc++) {
-		if (imc_counters_config[mc].fd != -1)
-			close(imc_counters_config[mc].fd);
+	for (i = 0; i < nr_bw_counters; i++) {
+		if (bw_counters[i].fd != -1)
+			close(bw_counters[i].fd);
 	}
 }
 
 /*
- * perf_open_imc_read_mem_bw - Open perf fds for IMCs
+ * perf_open_mem_bw_counters - Open perf fds for the reference-bandwidth counters
  * @cpu_no: CPU number that the benchmark PID is bound to
  *
  * Return: = 0 on success. < 0 on failure.
  */
-static int perf_open_imc_read_mem_bw(int cpu_no)
+static int perf_open_mem_bw_counters(int cpu_no)
 {
-	int imc, ret;
+	int i, ret;
 
-	for (imc = 0; imc < imcs; imc++)
-		imc_counters_config[imc].fd = -1;
+	for (i = 0; i < nr_bw_counters; i++)
+		bw_counters[i].fd = -1;
 
-	for (imc = 0; imc < imcs; imc++) {
-		ret = open_perf_read_event(imc, cpu_no);
+	for (i = 0; i < nr_bw_counters; i++) {
+		ret = open_perf_read_event(i, cpu_no);
 		if (ret)
 			goto close_fds;
 	}
@@ -268,56 +268,54 @@ static int perf_open_imc_read_mem_bw(int cpu_no)
 	return 0;
 
 close_fds:
-	perf_close_imc_read_mem_bw();
+	perf_close_mem_bw_counters();
 	return -1;
 }
 
 /*
- * do_imc_read_mem_bw_test - Perform memory bandwidth test
+ * do_mem_bw_test - Perform memory bandwidth test
  *
  * Runs memory bandwidth test over one second period. Also, handles starting
- * and stopping of the IMC perf counters around the test.
+ * and stopping of the reference perf counters around the test.
  */
-static void do_imc_read_mem_bw_test(void)
+static void do_mem_bw_test(void)
 {
-	int imc;
+	int i;
 
-	for (imc = 0; imc < imcs; imc++)
-		read_mem_bw_ioctl_perf_event_ioc_reset_enable(imc);
+	for (i = 0; i < nr_bw_counters; i++)
+		read_mem_bw_ioctl_perf_event_ioc_reset_enable(i);
 
 	sleep(1);
 
 	/* Stop counters after a second to get results. */
-	for (imc = 0; imc < imcs; imc++)
-		read_mem_bw_ioctl_perf_event_ioc_disable(imc);
+	for (i = 0; i < nr_bw_counters; i++)
+		read_mem_bw_ioctl_perf_event_ioc_disable(i);
 }
 
 /*
- * get_read_mem_bw_imc - Memory read bandwidth as reported by iMC counters
+ * get_mem_bw_ref - Memory bandwidth as reported by the reference PMU counters
  *
- * Memory read bandwidth utilized by a process on a socket can be calculated
- * using iMC counters' read events. Perf events are used to read these
- * counters.
+ * Sum all configured reference counters, scaled to MiB: read CAS counts on
+ * the x86 iMC.
  *
  * Return: = 0 on success. < 0 on failure.
  */
-static int get_read_mem_bw_imc(float *bw_imc)
+static int get_mem_bw_ref(float *bw_ref)
 {
-	float reads = 0, of_mul_read = 1;
-	int imc;
+	float bw = 0, of_mul = 1;
+	int i;
 
 	/*
-	 * Log read event values from all iMC counters into
-	 * struct imc_counter_config.
+	 * Log event values from all reference counters into
+	 * struct mem_bw_counter.
 	 * Take overflow into consideration before calculating total bandwidth.
 	 */
-	for (imc = 0; imc < imcs; imc++) {
-		struct imc_counter_config *r =
-			&imc_counters_config[imc];
+	for (i = 0; i < nr_bw_counters; i++) {
+		struct mem_bw_counter *r = &bw_counters[i];
 
 		if (read(r->fd, &r->return_value,
 			 sizeof(struct membw_read_format)) == -1) {
-			ksft_perror("Couldn't get read bandwidth through iMC");
+			ksft_perror("Couldn't read reference bandwidth counter");
 			return -1;
 		}
 
@@ -325,13 +323,13 @@ static int get_read_mem_bw_imc(float *bw_imc)
 		__u64 r_time_running = r->return_value.time_running;
 
 		if (r_time_enabled != r_time_running)
-			of_mul_read = (float)r_time_enabled /
+			of_mul = (float)r_time_enabled /
 					(float)r_time_running;
 
-		reads += r->return_value.value * of_mul_read * SCALE;
+		bw += r->return_value.value * of_mul * SCALE;
 	}
 
-	*bw_imc = reads;
+	*bw_ref = bw;
 	return 0;
 }
 
@@ -435,19 +433,19 @@ void signal_handler_unregister(void)
  * print_results_bw:	the memory bandwidth results are stored in a file
  * @filename:		file that stores the results
  * @bm_pid:		child pid that runs benchmark
- * @bw_imc:		perf imc counter value
+ * @bw_ref:		reference PMU counter value
  * @bw_resc:		memory bandwidth value
  *
  * Return:		0 on success, < 0 on error.
  */
-static int print_results_bw(char *filename, pid_t bm_pid, float bw_imc,
+static int print_results_bw(char *filename, pid_t bm_pid, float bw_ref,
 			    unsigned long bw_resc)
 {
-	unsigned long diff = fabs(bw_imc - bw_resc);
+	unsigned long diff = fabs(bw_ref - bw_resc);
 	FILE *fp;
 
 	if (strcmp(filename, "stdio") == 0 || strcmp(filename, "stderr") == 0) {
-		printf("Pid: %d \t Mem_BW_iMC: %f \t ", (int)bm_pid, bw_imc);
+		printf("Pid: %d \t Mem_BW_ref: %f \t ", (int)bm_pid, bw_ref);
 		printf("Mem_BW_resc: %lu \t Difference: %lu\n", bw_resc, diff);
 	} else {
 		fp = fopen(filename, "a");
@@ -456,8 +454,9 @@ static int print_results_bw(char *filename, pid_t bm_pid, float bw_imc,
 
 			return -1;
 		}
-		if (fprintf(fp, "Pid: %d \t Mem_BW_iMC: %f \t Mem_BW_resc: %lu \t Difference: %lu\n",
-			    (int)bm_pid, bw_imc, bw_resc, diff) <= 0) {
+		if (fprintf(fp,
+			    "Pid: %d \t Mem_BW_ref: %f \t Mem_BW_resc: %lu \t Difference: %lu\n",
+			    (int)bm_pid, bw_ref, bw_resc, diff) <= 0) {
 			ksft_print_msg("Could not log results\n");
 			fclose(fp);
 
@@ -475,10 +474,9 @@ static int print_results_bw(char *filename, pid_t bm_pid, float bw_imc,
  * @param:		Parameters passed to resctrl_val()
  * @bm_pid:		PID that runs the benchmark
  *
- * Measure memory bandwidth from resctrl and from another source which is
- * perf imc value or could be something else if perf imc event is not
- * available. Compare the two values to validate resctrl value. It takes
- * 1 sec to measure the data.
+ * Measure memory bandwidth from resctrl and from the independent reference
+ * PMU. Compare the two values to validate resctrl value. It takes 1 sec to
+ * measure the data.
  * resctrl does not distinguish between read and write operations so
  * its data includes all memory operations.
  */
@@ -487,42 +485,42 @@ int measure_read_mem_bw(const struct user_params *uparams,
 {
 	unsigned long bw_resc, bw_resc_start, bw_resc_end;
 	FILE *mem_bw_fp;
-	float bw_imc;
+	float bw_ref;
 	int ret;
 
 	mem_bw_fp = open_mem_bw_resctrl(mbm_total_path);
 	if (!mem_bw_fp)
 		return -1;
 
-	ret = perf_open_imc_read_mem_bw(uparams->cpu);
+	ret = perf_open_mem_bw_counters(uparams->cpu);
 	if (ret < 0)
 		goto close_fp;
 
 	ret = get_mem_bw_resctrl(mem_bw_fp, &bw_resc_start);
 	if (ret < 0)
-		goto close_imc;
+		goto close_counters;
 
 	rewind(mem_bw_fp);
 
-	do_imc_read_mem_bw_test();
+	do_mem_bw_test();
 
 	ret = get_mem_bw_resctrl(mem_bw_fp, &bw_resc_end);
 	if (ret < 0)
-		goto close_imc;
+		goto close_counters;
 
-	ret = get_read_mem_bw_imc(&bw_imc);
+	ret = get_mem_bw_ref(&bw_ref);
 	if (ret < 0)
-		goto close_imc;
+		goto close_counters;
 
-	perf_close_imc_read_mem_bw();
+	perf_close_mem_bw_counters();
 	fclose(mem_bw_fp);
 
 	bw_resc = (bw_resc_end - bw_resc_start) / MB;
 
-	return print_results_bw(param->filename, bm_pid, bw_imc, bw_resc);
+	return print_results_bw(param->filename, bm_pid, bw_ref, bw_resc);
 
-close_imc:
-	perf_close_imc_read_mem_bw();
+close_counters:
+	perf_close_mem_bw_counters();
 close_fp:
 	fclose(mem_bw_fp);
 	return ret;
