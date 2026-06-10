@@ -17,6 +17,23 @@
 #define MAX_BW_COUNTERS		20
 #define MAX_TOKENS		5
 
+/*
+ * NVIDIA SoC uncore/SCF (System Coherency Fabric) PMU: the ARM64 analog of the
+ * Intel iMC reference counters used to cross-check resctrl MBM. On Grace/Vera
+ * the fabric PMU registers generically as "nvidia_uncore_pmu_<n>"; the SCF
+ * instances (one per socket) are identified by the PMIIDR product-id field
+ * (0x2cf), independent of the device name. The driver does not register named
+ * events on this silicon, so the read (LLC refill) and write (LLC writeback)
+ * bandwidth events are encoded raw. Each event counts 64-byte cacheline
+ * transfers, i.e. the same SCALE as Intel CAS counts. Summing read+write
+ * matches resctrl's MBM total bytes (which includes reads and writes).
+ */
+#define UNCORE_NV_SCF		"nvidia_uncore_pmu"
+#define NV_SCF_PRODID		0x2cf
+#define NV_SCF_EVENT_READ	0xF1	/* scf_cache_refill */
+#define NV_SCF_EVENT_WRITE	0xF3	/* scf_cache_wb */
+#define CPU_PKG_ID_PATH		"/sys/devices/system/cpu/cpu%d/topology/physical_package_id"
+
 #define CON_MBM_LOCAL_BYTES_PATH		\
 	"%s/%s/mon_data/mon_L3_%02d/mbm_local_bytes"
 
@@ -258,6 +275,55 @@ static int num_of_imcs(void)
 	return count;
 }
 
+/* Read an unsigned value from a PMU device sysfs attribute. */
+static int read_pmu_value(const char *pmu, const char *attr, int base,
+			  unsigned long *val)
+{
+	char path[600], buf[64];
+	FILE *fp;
+
+	snprintf(path, sizeof(path), "%s/%s/%s", DYN_PMU_PATH, pmu, attr);
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	if (!fgets(buf, sizeof(buf), fp)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+	*val = strtoul(buf, NULL, base);
+	return 0;
+}
+
+/* physical_package_id (socket) of a logical CPU, < 0 on failure. */
+static int cpu_package_id(int cpu)
+{
+	char path[128];
+	int pkg = -1;
+	FILE *fp;
+
+	snprintf(path, sizeof(path), CPU_PKG_ID_PATH, cpu);
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	if (fscanf(fp, "%d", &pkg) != 1)
+		pkg = -1;
+	fclose(fp);
+	return pkg;
+}
+
+/* True if @pmu is an NVIDIA SCF instance (PMIIDR product id == NV_SCF_PRODID). */
+static bool is_nvidia_scf_pmu(const char *pmu)
+{
+	unsigned long id;
+
+	if (strncmp(pmu, UNCORE_NV_SCF, sizeof(UNCORE_NV_SCF) - 1))
+		return false;
+	if (read_pmu_value(pmu, "identifier", 16, &id))
+		return false;
+	return ((id >> 20) & 0xfff) == NV_SCF_PRODID;
+}
+
 /* True if any x86 uncore iMC PMU ("uncore_imc_<n>") is present. */
 static bool intel_imc_present(void)
 {
@@ -281,6 +347,93 @@ static bool intel_imc_present(void)
 	}
 	closedir(dp);
 	return found;
+}
+
+/* True if any NVIDIA SCF PMU instance is present. */
+static bool nvidia_scf_present(void)
+{
+	struct dirent *ep;
+	bool found = false;
+	DIR *dp;
+
+	dp = opendir(DYN_PMU_PATH);
+	if (!dp)
+		return false;
+	while ((ep = readdir(dp))) {
+		if (is_nvidia_scf_pmu(ep->d_name)) {
+			found = true;
+			break;
+		}
+	}
+	closedir(dp);
+	return found;
+}
+
+/*
+ * nvidia_scf_setup_counters - Configure SCF read+write bandwidth counters
+ * @bench_cpu: CPU the benchmark is bound to
+ *
+ * The SCF PMU is per-socket; pick the instance(s) on the benchmark's socket and
+ * configure two raw counters each (LLC refill = reads, LLC writeback = writes).
+ * Per-socket so traffic from the throttled MB domain is attributed correctly.
+ *
+ * Return: 0 on success, < 0 on failure.
+ */
+static int nvidia_scf_setup_counters(int bench_cpu)
+{
+	static const __u64 events[] = { NV_SCF_EVENT_READ, NV_SCF_EVENT_WRITE };
+	int bench_pkg = cpu_package_id(bench_cpu);
+	struct dirent *ep;
+	int n = 0;
+	DIR *dp;
+
+	if (bench_pkg < 0) {
+		ksft_print_msg("Could not determine socket of CPU %d\n", bench_cpu);
+		return -1;
+	}
+
+	dp = opendir(DYN_PMU_PATH);
+	if (!dp) {
+		ksft_perror("Unable to open PMU directory");
+		return -1;
+	}
+
+	while ((ep = readdir(dp))) {
+		unsigned long type, pmu_cpu;
+		size_t e;
+
+		if (!is_nvidia_scf_pmu(ep->d_name))
+			continue;
+		/* cpumask holds the representative CPU of this PMU instance. */
+		if (read_pmu_value(ep->d_name, "cpumask", 10, &pmu_cpu))
+			continue;
+		if (cpu_package_id((int)pmu_cpu) != bench_pkg)
+			continue;
+		if (read_pmu_value(ep->d_name, "type", 10, &type))
+			continue;
+
+		for (e = 0; e < ARRAY_SIZE(events) && n < MAX_BW_COUNTERS; e++) {
+			memset(&bw_counters[n], 0,
+			       sizeof(bw_counters[n]));
+			bw_counters[n].type = (__u32)type;
+			bw_counters[n].event = events[e];
+			bw_counters[n].umask = 0;
+			bw_counters[n].cpu = (int)pmu_cpu;
+			read_mem_bw_initialize_perf_event_attr(n);
+			/* System-wide (pid == -1) CPU event: inherit is invalid. */
+			bw_counters[n].pe.inherit = 0;
+			n++;
+		}
+	}
+	closedir(dp);
+
+	if (n == 0) {
+		ksft_print_msg("No NVIDIA SCF PMU found for socket %d\n", bench_pkg);
+		return -1;
+	}
+
+	nr_bw_counters = n;
+	return 0;
 }
 
 /*
@@ -314,6 +467,11 @@ static const struct mem_bw_backend mem_bw_backends[] = {
 		.name = "Intel iMC",
 		.detect = intel_imc_present,
 		.setup_counters = imc_setup_counters,
+	},
+	{
+		.name = "NVIDIA SCF",
+		.detect = nvidia_scf_present,
+		.setup_counters = nvidia_scf_setup_counters,
 	},
 };
 
@@ -430,7 +588,7 @@ static void do_mem_bw_test(void)
  * get_mem_bw_ref - Memory bandwidth as reported by the reference PMU counters
  *
  * Sum all configured reference counters, scaled to MiB: read CAS counts on
- * the x86 iMC.
+ * the x86 iMC, LLC refill + writeback counts on the NVIDIA SCF.
  *
  * Return: = 0 on success. < 0 on failure.
  */
@@ -661,8 +819,8 @@ static int print_results_bw(char *filename, pid_t bm_pid, float bw_ref,
  * @bm_pid:		PID that runs the benchmark
  *
  * Measure memory bandwidth from resctrl and from the independent reference
- * PMU. Compare the two values to validate resctrl value. It takes 1 sec to
- * measure the data.
+ * PMU (iMC on x86, SCF on NVIDIA ARM64). Compare the two values to validate
+ * resctrl value. It takes 1 sec to measure the data.
  * resctrl does not distinguish between read and write operations so
  * its data includes all memory operations.
  */

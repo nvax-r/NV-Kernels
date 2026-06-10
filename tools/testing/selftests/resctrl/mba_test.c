@@ -211,7 +211,7 @@ static int mba_run_test(const struct resctrl_test *test, const struct user_param
 /*
  * The MBA test runs wherever resctrl exposes an MB resource, a memory-bandwidth
  * monitor (x86 local bytes under L3_MON or MPAM total bytes under MB_MON), and
- * an independent reference-bandwidth PMU exists to
+ * an independent reference-bandwidth PMU (Intel iMC or NVIDIA SCF) exists to
  * validate against. It is not gated on CPU vendor.
  */
 static bool mba_feature_check(const struct resctrl_test *test)
